@@ -1,0 +1,266 @@
+---
+title: "R Notebook"
+author: "Evgeniya Khavronina"
+output:
+  html_document:
+    df_print: paged
+---
+
+Скрипт с митапа по R в ЕУСПб, проходившего 24.12.22 В нем мы собирали тексты рождественских песен и делали простой генератор текса, основанный на частотностях триграммов.
+
+Оригинальный скрипт для генерации текса взят из курса по NLP, который читался К. Маслинским весной 2022 в ЕУ.
+
+Загружаем библиотеки
+
+```{r}
+library(dplyr)        # для манипуляций с датафреймами
+library(readr)        # чтение csv
+library(stringr)      # работа со строками
+library(tidytext)     # токинезатор
+library(tidyr)        # функция separate()
+library(collections)  # для создания словаря
+library(rvest)        # для скрапинга данных
+library(data.table)   # для работы с датафреймами
+```
+
+Собираем песни
+
+```{r}
+# ссылка на сайт с текстами
+url <- 'https://www.christmassongsandcarols.com/collections/christmas-song-lyrics'
+
+# собираем ссылки со страницы
+links <- read_html(url) %>% 
+  # указываем нужные html элементы:
+  html_elements('.list-view-item.one-fifth a') %>% 
+  # указывает аттрибут ссылки:
+  html_attr('href')
+
+head(links)
+```
+
+```{r}
+# к ссылкам, которые мы достали, прибавляем адрес сайта 
+links <- paste0('https://www.christmassongsandcarols.com', links)
+head(links)
+```
+
+```{r}
+# собираем названия треков
+title <- read_html(url) %>% 
+  html_elements('.list-view-item.one-fifth a') %>% 
+  html_text2()
+
+head(title)
+```
+
+```{r}
+# собираем тексты со всех страниц
+# создаем пустой список
+text <- list()
+
+# с помощью цикла проходим по каждой ссылке и собираем текст
+num <- 1
+for (l in links) {
+  print(paste("Scraping", num, "of", length(links)))  # счетчик
+  text[[l]] <- read_html(l) %>% 
+    html_element('.lyrics-txt') %>% 
+    html_text()
+  num <- num+1
+}
+
+text[[1]]
+```
+
+```{r}
+# создаем датафрейм из текстов и объединяем с названиями песен
+text <- unlist(text)
+songs_df <- data.table(text, title, keep.rownames = F)
+
+head(songs_df)
+```
+
+```{r}
+# убираем повторяющиеся песни
+songs_df <- songs_df[!str_detect(songs_df$title, 'Remix|Instrumental|Remastered|Original')]
+
+# сохраняем полученный датасет
+#write.csv(songs_df, file='christmas_songs.csv', row.names=F, fileEncoding='UTF-8')
+#songs_df <- read_csv("christmas_songs.csv")
+```
+
+### Генератор текстов
+
+```{r}
+# токенизируем тексты на триграммы
+songs.trigram <- songs_df %>%
+  unnest_tokens(trigram, text, token="ngrams", n=3, to_lower=T)
+
+head(songs.trigram)
+```
+
+```{r}
+# разделяем триграммы на 3 колонки со словами
+songs.long <- songs.trigram %>%
+  separate(trigram, into=c('w1', 'w2', 'w3'), sep=" ")
+
+head(songs.long)
+```
+
+```{r}
+# Статистика N-грамм
+
+unigram.stat <- songs.long %>%
+  # считаем частотность 3 слова (можно взять и 1 или 2 слово, они повторяются в триграммах):
+  count(w3, name="unifreq", sort=TRUE) %>%
+  # создаем колонку с независимой вероятностью появления каждого слова в датасете:
+  mutate(uniprob = unifreq/sum(unifreq))
+
+head(unigram.stat)
+```
+
+```{r}
+bigram.stat <- songs.long %>%
+  # считаем совместную встречаемость 2 и 3 слова:
+  count(w2, w3, name="bifreq", sort=TRUE) %>%
+  # группировка нужна, чтобы посчитать вероятность встретить второе слово (w3),
+  # если уже встретилось первое (w2):
+  group_by(w2) %>%
+  # создаем колонку с вероятностью:
+  mutate(biprob = bifreq/sum(bifreq))
+
+head(bigram.stat)
+```
+
+```{r}
+trigram.stat <- songs.long %>%
+  # считаем триграммы:
+  count(w1, w2, w3, name="trifreq", sort=TRUE) %>%
+  # группируем по 1 и 2 слову:
+  group_by(w1, w2) %>%
+  # считаем возможность встретить 3 слово, если встретились 1 и 2:
+  mutate(triprob = trifreq/sum(trifreq))
+
+head(trigram.stat)
+```
+
+Создаем функции
+
+```{r}
+# Униграммная модель
+
+# функция, которая принимает на вход датафрейм с вероятностями каждого слова
+# и количество гененируемых слов (по умолчанияю - 10, если не указано другое):
+unigram_model <- function(data, n=10) {
+  paste(sample(data$w3, n, prob=data$uniprob), collapse=" ")
+}
+
+# Биграммная модель: 
+
+# сначала создаем списки слов
+bidata <- bigram.stat %>% 
+  # группируем по 2 слову:
+  group_by(w2) %>%
+  # создаем списки из всех возможных слов, встречающихся после второго:
+  summarize(w3=list(w3), prob=list(biprob))
+
+bidata
+```
+
+```{r}
+# создадим словарь со списками вероятностей:
+bidict <- dict(items=Map(list, w3=bidata$w3, prob=bidata$prob), keys=bidata$w2)
+
+# пример того, как работает словарь
+
+# указываем ключевое слово, создается список с возможными за ним словами и их вероятностями
+l <- bidict$get("the") 
+
+l
+```
+
+```{r}
+# можем случайно, учитывая вероятности, выбрать одно слово, следующее за "the"
+sample(l$w3, 1, prob=l$prob)
+```
+
+Создаем функцию-генератор текста
+
+```{r}
+bigram_model <- function(bidict, w2, n=10) {
+  # создаем пустой список:
+  text <- list()
+  # первым словом в списке будет то, которое мы укажем функции:
+  text[[1]] <- w2
+  # с помощью цикла генерируем остальные слова, начиная со 2 до n:
+  for (i in seq(2, n)) {
+    # каждый раз обращаемся к предыдущему слову в списке:
+    l <- bidict$get(text[[i-1]])  
+    # выбираем семпл, как в примере выше:
+    text[[i]] <- sample(l$w3, 1, prob=l$prob)
+  }
+  # на выход подаем текст из списка слов:
+  paste(text, collapse=" ")
+}
+
+
+# Используем свободный генератор, который в качестве первого слова выбирает случайное
+# с учетом вероятностей из униграммной модели:
+  
+bigram_model(bidict, unigram_model(unigram.stat, 1), 100)
+```
+
+Создадим триграммную модель, учитывающую совместную встречаемость трех слов. Она гененирует более правдопомодный текст. Однако триграммную модель лучше не использовать на маленьких корпусах, поскольку многие триграммы встречаются в корпусе только один раз, из-за чего генератор может просто воспоризвести дословно какую-то песню.
+
+```{r}
+# Триграммная модель:
+
+# создадим еще один словарь
+tridata <- trigram.stat %>% group_by(w1, w2) %>% summarize(w3=list(w3), prob=list(triprob))
+tridict <- dict(items=Map(list, w3=tridata$w3, prob=tridata$prob), keys=paste(tridata$w1, tridata$w2, sep=" "))
+
+# пример генерации триграмма
+
+# сначала случайно генерируем первые два слова:
+w1w2 <- bigram_model(bidict, "the", 2)
+w1w2 <- bigram_model(bidict, unigram_model(unigram.stat, 1), 2)
+w1w2
+```
+
+```{r}
+# теперь из словаря триграммов достаем все возможные третьи слова для данного биграмма
+# на маленьком корпусе велика вероятность, что такое слово будет лишь одно
+tridict$get(w1w2)
+```
+
+```{r}
+# Функция-генератор текста работает аналогично предыдущей
+
+trigram_model <- function(tridict, w1w2, n=10) {
+  cw <- unlist(strsplit(w1w2, " "))
+  text <- list()
+  text[[1]] <- cw[1]
+  text[[2]] <- cw[2]
+  for (i in seq(3, n)) {
+    key <- paste(text[[i-2]], text[[i-1]], collapse=" ")
+    l <- tridict$get(key)
+    text[[i]] <- sample(l$w3, 1, prob=l$prob)
+  }
+  paste(text, collapse=" ")
+}
+
+
+# Свободный генератор от 1 слова
+
+# укажем в качестве аргумента первое слово, а второе подберет прошлая функция
+trigram_model(tridict, bigram_model(bidict, "christmas", 2))
+```
+
+```{r}
+# Полностью свободный генератор
+
+# в функцию для триграммов укажем в качестве аргумента биграммную функцию, 
+# а для нее - униграммную, получится такая матрешка
+
+trigram_model(tridict, bigram_model(bidict, unigram_model(unigram.stat, 1), 2), 10)
+```
